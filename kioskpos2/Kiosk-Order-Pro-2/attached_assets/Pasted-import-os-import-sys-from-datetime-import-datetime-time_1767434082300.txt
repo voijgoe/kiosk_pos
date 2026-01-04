@@ -1,0 +1,865 @@
+import os
+import sys
+from datetime import datetime, timedelta
+import sqlite3
+import json
+import csv
+from collections import Counter
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.popup import Popup
+from kivy.uix.spinner import Spinner
+from kivy.uix.modalview import ModalView
+from kivy.core.window import Window
+from kivy.graphics import Color, Rectangle
+from kivy.utils import get_color_from_hex
+from kivy.core.text import LabelBase
+from kivy.lang import Builder
+from kivy.uix.widget import Widget
+
+# ----------------- Configuration -----------------
+
+CHEF_NUMBER = "+919501614511"
+SETTINGS_FILE = "kiosk_settings.json"
+DB_FILE = "kiosk_billing.db"
+DEFAULT_FONT = 'Roboto' # Kivy's default font
+
+# Android file paths
+
+def get_android_storage_path():
+    """Get writable storage path on Android"""
+    try:
+        from android.storage import app_storage_path
+        from jnius import autoclass
+        Environment = autoclass('android.os.Environment')
+        return Environment.getExternalStorageDirectory().getAbsolutePath()
+    except:
+        return os.path.dirname(os.path.abspath(__file__))
+
+def get_reports_path():
+    """Get path for saving reports"""
+    base_path = get_android_storage_path()
+    reports_path = os.path.join(base_path, "KioskPOS_Reports")
+    os.makedirs(reports_path, exist_ok=True)
+    return reports_path
+
+def load_settings():
+    settings_path = os.path.join(get_android_storage_path(), SETTINGS_FILE)
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    # Default settings now just uses 'EN'
+    return {"lang": "EN", "shop_name": "Kiosk POS System"}
+
+def save_settings(s):
+    settings_path = os.path.join(get_android_storage_path(), SETTINGS_FILE)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+
+SETTINGS = load_settings()
+
+# ----------------- Database Setup -----------------
+
+def ensure_db():
+    db_path = os.path.join(get_android_storage_path(), DB_FILE)
+    if not os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("""CREATE TABLE menu (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, price REAL NOT NULL)""")
+        c.execute("""CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, item_name TEXT NOT NULL, quantity INTEGER NOT NULL, price REAL NOT NULL, payment_mode TEXT NOT NULL, notes TEXT)""")
+        c.executemany("INSERT INTO menu (name,price) VALUES (?,?)", [('Burger',50), ('Tea',10), ('Coffee',20), ('Sandwich',40)])
+        conn.commit()
+        conn.close()
+
+ensure_db()
+
+def db_conn():
+    db_path = os.path.join(get_android_storage_path(), DB_FILE)
+    return sqlite3.connect(db_path)
+
+def get_menu_items():
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, name, price FROM menu ORDER BY name")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def add_menu_item(name, price):
+    conn = db_conn()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO menu (name,price) VALUES (?,?)", (name, price))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def update_menu_item(item_id, name, price):
+    conn = db_conn()
+    c = conn.cursor()
+    try:
+        c.execute("UPDATE menu SET name=?, price=? WHERE id=?", (name, price, item_id))
+        conn.commit()
+        return True
+    except:
+        return False
+    finally:
+        conn.close()
+
+def delete_menu_item(item_id):
+    conn = db_conn()
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM menu WHERE id=?", (item_id,))
+        conn.commit()
+        return True
+    except:
+        return False
+    finally:
+        conn.close()
+
+def record_sale(item_name, quantity, price, payment_mode, notes):
+    conn = db_conn()
+    c = conn.cursor()
+    dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO sales (date,item_name,quantity,price,payment_mode,notes) VALUES (?,?,?,?,?,?)", (dt, item_name, quantity, price, payment_mode, notes))
+    conn.commit()
+    conn.close()
+
+def get_sales_by_date(date_str):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute("SELECT id,date,item_name,quantity,price,payment_mode,notes FROM sales WHERE date LIKE ? ORDER BY id", (f"{date_str}%",))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# Removed: get_sales_summary_by_hour
+
+# ----------------- Kivy GUI Components -----------------
+
+class NumberPad(Popup):
+    # --- NumberPad CLASS FOR MULTI-DIGIT INPUT ---
+    def __init__(self, callback, **kwargs):
+        super().__init__(**kwargs)
+        self.callback = callback
+        self.current_input = ''
+        self.title = 'Quantity'
+        self.title_font = DEFAULT_FONT
+        self.size_hint = (0.8, 0.6)
+        self.auto_dismiss = False
+        
+        main_layout = BoxLayout(orientation='vertical', spacing=5, padding=10)
+
+        # Display for current input
+        self.input_label = Label(text='0', font_size=32, size_hint_y=0.2, color=(1,1,1,1))
+        main_layout.add_widget(self.input_label)
+        
+        # Grid for number buttons
+        layout = GridLayout(cols=3, rows=4, spacing=5, size_hint_y=0.8)
+        numbers = ['7', '8', '9', '4', '5', '6', '1', '2', '3', 'C', '0', 'OK']
+        for num in numbers:
+            btn = Button(text=num, font_size=24, background_color=get_color_from_hex('#333333'), color=(1,1,1,1))
+            btn.bind(on_release=self.on_button_press)
+            layout.add_widget(btn)
+
+        main_layout.add_widget(layout)
+        self.content = main_layout
+
+    def on_button_press(self, instance):
+        text = instance.text
+        if text == 'OK':
+            if self.current_input.isdigit() and int(self.current_input) > 0:
+                self.callback(self.current_input)
+            else:
+                self.callback('') # Send empty string for no action/invalid input
+            self.dismiss()
+        elif text == 'C':
+            self.current_input = ''
+            self.input_label.text = '0'
+        elif text.isdigit():
+            # Max length check to prevent absurdly large numbers
+            if len(self.current_input) < 5:
+                self.current_input += text
+                self.input_label.text = self.current_input
+    
+class CartItem(BoxLayout):
+    def __init__(self, name, quantity, price, remove_callback, **kwargs):
+        super().__init__(**kwargs)
+        self.orientation = 'horizontal'
+        self.size_hint_y = None
+        self.height = 50
+        self.spacing = 10
+
+        # Hardcoded default font
+        self.add_widget(Label(text=name, size_hint_x=0.4, halign='left', color=(1,1,1,1), font_name=DEFAULT_FONT))
+        self.add_widget(Label(text=str(quantity), size_hint_x=0.2, color=(1,1,1,1), font_name=DEFAULT_FONT))
+        self.add_widget(Label(text=f"₹{price:.2f}", size_hint_x=0.3, color=(1,1,1,1), font_name=DEFAULT_FONT))
+
+        remove_btn = Button(text='×', size_hint_x=0.1, background_color=(1, 0, 0, 1))
+        remove_btn.bind(on_release=lambda x: remove_callback(name))
+        self.add_widget(remove_btn)
+
+class MenuItemWidget(BoxLayout):
+    def __init__(self, item_id, name, price, edit_callback, delete_callback, **kwargs):
+        super().__init__(**kwargs)
+        self.orientation = 'horizontal'
+        self.size_hint_y = None
+        self.height = 60
+        self.spacing = 10
+        self.item_id = item_id
+
+        # Hardcoded default font
+        self.add_widget(Label(text=name, size_hint_x=0.4, color=(1,1,1,1), font_name=DEFAULT_FONT))
+        self.add_widget(Label(text=f"₹{price:.2f}", size_hint_x=0.3, color=(1,1,1,1), font_name=DEFAULT_FONT))
+
+        btn_layout = BoxLayout(size_hint_x=0.3, spacing=5)
+
+        # Hardcoded English button text
+        edit_btn = Button(text='Edit', size_hint_x=0.5, font_size='16sp', font_name=DEFAULT_FONT)
+        delete_btn = Button(text='Del', size_hint_x=0.5, font_size='16sp', background_color=(1,0,0,1), font_name=DEFAULT_FONT)
+
+        edit_btn.bind(on_release=lambda x, n=name, p=price: edit_callback(item_id, n, p))
+        delete_btn.bind(on_release=lambda x, n=name: delete_callback(item_id, n))
+
+        btn_layout.add_widget(edit_btn)
+        btn_layout.add_widget(delete_btn)
+        self.add_widget(btn_layout)
+
+        self.edit_callback = edit_callback
+        self.delete_callback = delete_callback
+
+# ----------------- Main App -----------------
+
+class KioskApp(App):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.cart = []
+        self.shop_name = SETTINGS.get("shop_name", "Kiosk POS System")
+        self.popup = None
+        self.current_screen = None
+        # Store all menu items once
+        self.all_menu_items = get_menu_items() 
+
+    def build(self):
+        Window.clearcolor = (0, 0, 0, 1)
+        return self.create_dashboard()
+
+    def create_dashboard(self):
+        self.current_screen = "dashboard"
+        layout = BoxLayout(orientation='vertical', spacing=10, padding=20)
+
+        # Header with golden title
+        header = BoxLayout(size_hint_y=0.15)
+
+        # Hardcoded English title
+        title = Label(text=self.shop_name, font_size='28sp', bold=True, color=get_color_from_hex('#FFD700'), font_name=DEFAULT_FONT)
+        header.add_widget(title)
+
+        # Removed: Language selector spinner
+
+        layout.add_widget(header)
+
+        # Main buttons
+        button_grid = GridLayout(cols=2, spacing=15, size_hint_y=0.7)
+
+        buttons = [
+            ('New Order', self.open_new_order, '#FF7043'),
+            ('Menu', self.open_menu, '#4CAF50'),
+            ('Today Report', self.open_today_report, '#29B6F6'),
+            ('Reports', self.open_reports, '#FFCA28'),
+        ]
+
+        for text, callback, color in buttons:
+            # Hardcoded English button text and default font
+            btn = Button(text=text, background_color=get_color_from_hex(color),
+                        font_size='18sp', color=(1, 1, 1, 1), font_name=DEFAULT_FONT)
+            btn.bind(on_release=callback)
+            button_grid.add_widget(btn)
+
+        layout.add_widget(button_grid)
+
+        # Footer with sales summary
+        footer = BoxLayout(size_hint_y=0.15)
+        today_sales = get_sales_by_date(datetime.now().strftime("%Y-%m-%d"))
+        total = sum(s[4] for s in today_sales) if today_sales else 0
+        count = sum(s[3] for s in today_sales) if today_sales else 0
+
+        # Hardcoded English footer text and default font
+        status = Label(text=f"Total: ₹{total} • {count} items",
+                      font_size='16sp', color=(1,1,1,1), font_name=DEFAULT_FONT)
+        footer.add_widget(status)
+
+        layout.add_widget(footer)
+
+        # Bind back button
+        Window.bind(on_keyboard=self.on_back_button)
+
+        return layout
+
+    def on_back_button(self, window, key, *args):
+        if key == 27:  # Android back button
+            if self.current_screen != "dashboard":
+                self.go_back()
+                return True
+        return False
+
+    def go_back(self):
+        if self.popup:
+            self.popup.dismiss()
+            self.popup = None
+        self.current_screen = "dashboard"
+
+        # Refresh dashboard
+        self.root.clear_widgets()
+        self.root.add_widget(self.create_dashboard())
+        # Removed: switch_language method
+
+    def open_new_order(self, instance):
+        self.current_screen = "new_order"
+        content = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+        # Back button
+        back_btn = Button(text='Back', size_hint_y=0.08, background_color=get_color_from_hex('#666666'), font_name=DEFAULT_FONT)
+        back_btn.bind(on_release=lambda x: self.go_back())
+        content.add_widget(back_btn)
+
+        # Search bar
+        search_layout = BoxLayout(size_hint_y=0.1)
+        self.search_input = TextInput(hint_text='Search menu items...', multiline=False,
+                                      background_color=get_color_from_hex('#333333'),
+                                      foreground_color=(1,1,1,1), font_name=DEFAULT_FONT)
+        # --- Bind search input to filter function ---
+        self.search_input.bind(text=self.filter_menu_items)
+        search_layout.add_widget(self.search_input)
+        content.add_widget(search_layout)
+
+        # Menu items
+        self.menu_scroll = ScrollView(size_hint_y=0.5)
+        self.menu_layout = GridLayout(cols=2, spacing=10, size_hint_y=None)
+        self.menu_layout.bind(minimum_height=self.menu_layout.setter('height'))
+
+        self.menu_scroll.add_widget(self.menu_layout)
+        content.add_widget(self.menu_scroll)
+
+        # Cart section
+        cart_label = Label(text="Cart:", size_hint_y=0.1, font_size='18sp', color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(cart_label)
+
+        self.cart_scroll = ScrollView(size_hint_y=0.2)
+        self.cart_layout = BoxLayout(orientation='vertical', size_hint_y=None)
+        self.cart_layout.bind(minimum_height=self.cart_layout.setter('height'))
+        self.cart_scroll.add_widget(self.cart_layout)
+        content.add_widget(self.cart_scroll)
+
+        # Checkout buttons
+        btn_layout = BoxLayout(size_hint_y=0.1, spacing=10)
+        checkout_btn = Button(text='Checkout', background_color=get_color_from_hex('#4CAF50'), font_name=DEFAULT_FONT)
+        clear_btn = Button(text='Clear Cart', background_color=get_color_from_hex('#F44336'), font_name=DEFAULT_FONT)
+
+        checkout_btn.bind(on_release=self.checkout)
+        clear_btn.bind(on_release=self.clear_cart)
+
+        btn_layout.add_widget(checkout_btn)
+        btn_layout.add_widget(clear_btn)
+        content.add_widget(btn_layout)
+
+        # Initial display of menu items
+        self.all_menu_items = get_menu_items() # Ensure up-to-date list
+        self.display_menu_items(self.all_menu_items)
+        self.update_cart_display()
+
+        self.show_popup('New Order', content, size_hint=(0.95, 0.95))
+    
+    # --- Function to filter and display menu items ---
+    def display_menu_items(self, menu_items):
+        self.menu_layout.clear_widgets()
+        for item_id, name, price in menu_items:
+            item_btn = Button(
+                text=f"{name}\n₹{price:.2f}",
+                size_hint_y=None,
+                height=120,
+                background_color=get_color_from_hex('#444444'),
+                color=(1,1,1,1),
+                font_size='16sp',
+                font_name=DEFAULT_FONT
+            )
+            item_btn.bind(on_release=lambda x, n=name, p=price: self.add_to_cart(n, p))
+            self.menu_layout.add_widget(item_btn)
+
+    def filter_menu_items(self, instance, value):
+        search_term = value.lower()
+        # Refresh menu items in case of changes in the menu screen
+        self.all_menu_items = get_menu_items() 
+        
+        filtered_items = [
+            item for item in self.all_menu_items 
+            if search_term in item[1].lower() # item[1] is the name
+        ]
+        self.display_menu_items(filtered_items)
+
+    def add_to_cart(self, name, price):
+        def on_quantity_selected(value):
+            if value and value.isdigit():
+                qty = int(value)
+                if qty > 0:
+                    # Check if item already in cart
+                    for item in self.cart:
+                        if item['name'] == name:
+                            item['quantity'] += qty
+                            item['price'] = item['unit_price'] * item['quantity']
+                            self.update_cart_display()
+                            return
+
+                    # Add new item
+                    self.cart.append({
+                        'name': name,
+                        'quantity': qty,
+                        'price': price * qty,
+                        'unit_price': price
+                    })
+                    self.update_cart_display()
+
+        numpad = NumberPad(on_quantity_selected)
+        numpad.open()
+
+    def update_cart_display(self):
+        self.cart_layout.clear_widgets()
+        total_amount = 0
+
+        for item in self.cart:
+            cart_item = CartItem(
+                item['name'],
+                item['quantity'],
+                item['price'],
+                self.remove_from_cart
+            )
+            self.cart_layout.add_widget(cart_item)
+            total_amount += item['price']
+
+        # Add total row
+        if self.cart:
+            total_layout = BoxLayout(orientation='horizontal', size_hint_y=None, height=50)
+            total_layout.add_widget(Label(text="Total:", font_size='16sp', bold=True, color=(1,1,1,1), font_name=DEFAULT_FONT))
+            total_layout.add_widget(Label(text=f"₹{total_amount:.2f}", font_size='16sp', bold=True, color=(1,1,1,1), font_name=DEFAULT_FONT))
+            total_layout.add_widget(Label(text="", size_hint_x=0.1))  # spacer
+            self.cart_layout.add_widget(total_layout)
+
+    def remove_from_cart(self, name):
+        self.cart = [item for item in self.cart if item['name'] != name]
+        self.update_cart_display()
+
+    def clear_cart(self, instance):
+        self.cart = []
+        self.update_cart_display()
+        self.show_alert("Cart Cleared!")
+
+    def checkout(self, instance):
+        if not self.cart:
+            self.show_alert("Cart Empty")
+            return
+
+        content = BoxLayout(orientation='vertical', spacing=10, padding=20)
+
+        content.add_widget(Label(text='Payment Mode', font_size='18sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+        payment_spinner = Spinner(
+            text='Cash',
+            values=('Cash', 'UPI', 'Card'),
+            size_hint_y=0.2,
+            background_color=get_color_from_hex('#333333'),
+            color=(1,1,1,1)
+        )
+        content.add_widget(payment_spinner)
+
+        content.add_widget(Label(text='Notes', font_size='18sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+        notes_input = TextInput(hint_text='Notes', multiline=True, size_hint_y=0.3,
+                              background_color=get_color_from_hex('#333333'), foreground_color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(notes_input)
+
+        total = sum(item['price'] for item in self.cart)
+        total_label = Label(text=f"Total: ₹{total:.2f}", font_size='20sp', bold=True, color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(total_label)
+
+        def process_checkout(btn):
+            # Record sales
+            for item in self.cart:
+                record_sale(
+                    item['name'],
+                    item['quantity'],
+                    item['unit_price'] * item['quantity'],
+                    payment_spinner.text,
+                    notes_input.text
+                )
+
+            self.send_chef_message(notes_input.text)
+
+            self.cart = []
+            if self.popup:
+                self.popup.dismiss()
+            self.show_alert("Order Complete!")
+            self.go_back()
+
+        btn_layout = BoxLayout(size_hint_y=0.2, spacing=10)
+        confirm_btn = Button(text='Confirm', background_color=get_color_from_hex('#4CAF50'))
+        cancel_btn = Button(text='Cancel', background_color=get_color_from_hex('#F44336'), font_name=DEFAULT_FONT)
+
+        confirm_btn.bind(on_release=process_checkout)
+        cancel_btn.bind(on_release=lambda x: self.popup.dismiss() if self.popup else None)
+
+        btn_layout.add_widget(confirm_btn)
+        btn_layout.add_widget(cancel_btn)
+        content.add_widget(btn_layout)
+
+        self.show_popup('Checkout', content)
+
+    def send_chef_message(self, notes):
+        """WhatsApp integration"""
+        try:
+            grouped = Counter()
+            for item in self.cart:
+                grouped[item['name']] += item['quantity']
+
+            message = "New Order:\n"
+
+            for item, qty in grouped.items():
+                message += f"{item} x{qty}\n"
+
+            message += f"\nTotal: ₹{sum(item['price'] for item in self.cart):.2f}"
+            if notes:
+                message += f"\nNotes: {notes}"
+
+            # Create WhatsApp URL
+            import urllib.parse
+            encoded_message = urllib.parse.quote(message)
+            whatsapp_url = f"https://wa.me/{CHEF_NUMBER}?text={encoded_message}"
+
+            # Try to open WhatsApp
+            try:
+                import webbrowser
+                webbrowser.open(whatsapp_url)
+            except:
+                self.show_alert(f"Message ready for WhatsApp:\n\n{message}")
+
+        except Exception as e:
+            self.show_alert(f"Error: {str(e)}")
+
+    def open_menu(self, instance):
+        self.current_screen = "menu"
+        content = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+        # Back button
+        back_btn = Button(text='Back', size_hint_y=0.08, background_color=get_color_from_hex('#666666'), font_name=DEFAULT_FONT)
+        back_btn.bind(on_release=lambda x: self.go_back())
+        content.add_widget(back_btn)
+
+        scroll = ScrollView()
+        menu_layout = BoxLayout(orientation='vertical', size_hint_y=None, spacing=5)
+        menu_layout.bind(minimum_height=menu_layout.setter('height'))
+
+        # Header
+        header = BoxLayout(orientation='horizontal', size_hint_y=None, height=50)
+        header.add_widget(Label(text='Item', color=(1,1,1,1), bold=True, font_name=DEFAULT_FONT))
+        header.add_widget(Label(text='Price', color=(1,1,1,1), bold=True, font_name=DEFAULT_FONT))
+        header.add_widget(Label(text='Action', color=(1,1,1,1), bold=True, font_name=DEFAULT_FONT))
+        menu_layout.add_widget(header)
+
+        menu_items = get_menu_items()
+        for item_id, name, price in menu_items:
+            item_widget = MenuItemWidget(
+                item_id, name, price,
+                self.edit_menu_item,
+                self.delete_menu_item
+            )
+            menu_layout.add_widget(item_widget)
+
+        scroll.add_widget(menu_layout)
+        content.add_widget(scroll)
+
+        add_btn = Button(text='Add Item', size_hint_y=0.15,
+                        background_color=get_color_from_hex('#4CAF50'), font_name=DEFAULT_FONT)
+        add_btn.bind(on_release=self.add_menu_item)
+        content.add_widget(add_btn)
+
+        self.show_popup('Menu', content, size_hint=(0.9, 0.9))
+
+    def add_menu_item(self, instance):
+        content = BoxLayout(orientation='vertical', spacing=10, padding=20)
+
+        content.add_widget(Label(text="Item Name", font_size='16sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+        name_input = TextInput(multiline=False, font_size='16sp', size_hint_y=0.2,
+                              background_color=get_color_from_hex('#333333'), foreground_color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(name_input)
+
+        content.add_widget(Label(text="Price (₹)", font_size='16sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+        price_input = TextInput(multiline=False, input_filter='float', font_size='16sp', size_hint_y=0.2,
+                              background_color=get_color_from_hex('#333333'), foreground_color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(price_input)
+
+        def save_item(btn):
+            if name_input.text.strip() and price_input.text.strip():
+                try:
+                    price = float(price_input.text)
+                    if add_menu_item(name_input.text.strip(), price):
+                        self.show_alert("Item added successfully!")
+                        if self.popup:
+                            self.popup.dismiss()
+                        self.open_menu(None)
+                    else:
+                        self.show_alert("Item already exists!")
+                except ValueError:
+                    self.show_alert("Please enter a valid price!")
+            else:
+                self.show_alert("Please enter both name and price!")
+
+        btn_layout = BoxLayout(size_hint_y=0.3, spacing=10)
+        save_btn = Button(text='Save', background_color=get_color_from_hex('#4CAF50'), font_name=DEFAULT_FONT)
+        cancel_btn = Button(text='Cancel', background_color=get_color_from_hex('#F44336'), font_name=DEFAULT_FONT)
+
+        save_btn.bind(on_release=save_item)
+        cancel_btn.bind(on_release=lambda x: self.popup.dismiss() if self.popup else None)
+
+        btn_layout.add_widget(save_btn)
+        btn_layout.add_widget(cancel_btn)
+        content.add_widget(btn_layout)
+
+        self.show_popup('Add Item', content)
+
+    def edit_menu_item(self, item_id, current_name, current_price):
+        content = BoxLayout(orientation='vertical', spacing=10, padding=20)
+
+        content.add_widget(Label(text="Item Name", font_size='16sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+        name_input = TextInput(text=current_name, multiline=False, font_size='16sp', size_hint_y=0.2,
+                              background_color=get_color_from_hex('#333333'), foreground_color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(name_input)
+
+        content.add_widget(Label(text="Price (₹)", font_size='16sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+        price_input = TextInput(text=str(current_price), multiline=False, input_filter='float',
+                               font_size='16sp', size_hint_y=0.2,
+                              background_color=get_color_from_hex('#333333'), foreground_color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(price_input)
+
+        def save_item(btn):
+            if name_input.text.strip() and price_input.text.strip():
+                try:
+                    price = float(price_input.text)
+                    if update_menu_item(item_id, name_input.text.strip(), price):
+                        self.show_alert("Item updated successfully!")
+                        if self.popup:
+                            self.popup.dismiss()
+                        self.open_menu(None)
+                    else:
+                        self.show_alert("Error updating item!")
+                except ValueError:
+                    self.show_alert("Please enter a valid price!")
+            else:
+                self.show_alert("Please enter both name and price!")
+
+        btn_layout = BoxLayout(size_hint_y=0.3, spacing=10)
+        save_btn = Button(text='Save', background_color=get_color_from_hex('#4CAF50'), font_name=DEFAULT_FONT)
+        cancel_btn = Button(text='Cancel', background_color=get_color_from_hex('#F44336'), font_name=DEFAULT_FONT)
+
+        save_btn.bind(on_release=save_item)
+        cancel_btn.bind(on_release=lambda x: self.popup.dismiss() if self.popup else None)
+
+        btn_layout.add_widget(save_btn)
+        btn_layout.add_widget(cancel_btn)
+        content.add_widget(btn_layout)
+
+        self.show_popup('Edit Item', content)
+
+    def delete_menu_item(self, item_id, item_name):
+        def confirm_delete(instance):
+            if delete_menu_item(item_id):
+                self.show_alert("Item deleted successfully!")
+                if self.popup:
+                    self.popup.dismiss()
+                self.open_menu(None)
+            else:
+                self.show_alert("Error deleting item!")
+
+        content = BoxLayout(orientation='vertical', spacing=10, padding=20)
+        content.add_widget(Label(text=f"Delete {item_name}?", font_size='18sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+
+        btn_layout = BoxLayout(size_hint_y=0.3, spacing=10)
+        yes_btn = Button(text='Yes', background_color=get_color_from_hex('#4CAF50'))
+        no_btn = Button(text='No', background_color=get_color_from_hex('#F44336'))
+
+        yes_btn.bind(on_release=confirm_delete)
+        no_btn.bind(on_release=lambda x: self.popup.dismiss() if self.popup else None)
+
+        btn_layout.add_widget(yes_btn)
+        btn_layout.add_widget(no_btn)
+        content.add_widget(btn_layout)
+
+        self.show_popup('Delete Item', content)
+
+    def open_today_report(self, instance):
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        self.show_report(date_str)
+
+    def open_reports(self, instance):
+        content = BoxLayout(orientation='vertical', spacing=10, padding=20)
+
+        content.add_widget(Label(text="Enter date (YYYY-MM-DD)", font_size='16sp', color=(1,1,1,1)))
+        date_input = TextInput(
+            text=datetime.now().strftime("%Y-%m-%d"),
+            multiline=False,
+            font_size='16sp',
+            size_hint_y=0.2,
+            background_color=get_color_from_hex('#333333'),
+            foreground_color=(1,1,1,1)
+        )
+        content.add_widget(date_input)
+
+        def load_report(btn):
+            try:
+                datetime.strptime(date_input.text, "%Y-%m-%d")
+                if self.popup:
+                    self.popup.dismiss()
+                self.show_report(date_input.text)
+            except:
+                self.show_alert("Invalid date format! Use YYYY-MM-DD")
+
+        btn_layout = BoxLayout(size_hint_y=0.3, spacing=10)
+        load_btn = Button(text="Load Report", background_color=get_color_from_hex('#4CAF50'))
+        cancel_btn = Button(text='Cancel', background_color=get_color_from_hex('#F44336'), font_name=DEFAULT_FONT)
+
+        load_btn.bind(on_release=load_report)
+        cancel_btn.bind(on_release=lambda x: self.popup.dismiss() if self.popup else None)
+
+        btn_layout.add_widget(load_btn)
+        btn_layout.add_widget(cancel_btn)
+        content.add_widget(btn_layout)
+
+        self.show_popup('Reports', content)
+
+    def show_report(self, date_str):
+        self.current_screen = "report"
+        sales = get_sales_by_date(date_str)
+
+        content = BoxLayout(orientation='vertical', spacing=10, padding=10)
+
+        # Back button
+        back_btn = Button(text='Back', size_hint_y=0.08, background_color=get_color_from_hex('#666666'), font_name=DEFAULT_FONT)
+        back_btn.bind(on_release=lambda x: self.go_back())
+        content.add_widget(back_btn)
+
+        if not sales:
+            content.add_widget(Label(text="No sales for this date", font_size='18sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+            self.show_popup(f"Sales Report - {date_str}", content, size_hint=(0.95, 0.95))
+            return
+
+        total = sum(s[4] for s in sales)
+        total_label = Label(text=f"Total Sales: ₹{total:.2f}", font_size='20sp', bold=True, color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(total_label)
+
+        # Detailed sales table (now taking up more vertical space)
+        table_label = Label(text="Detailed Sales:", size_hint_y=0.05, font_size='16sp', bold=True, color=(1,1,1,1), font_name=DEFAULT_FONT)
+        content.add_widget(table_label)
+
+        # Increased size_hint_y to 0.75 to occupy the space where the graph was
+        scroll = ScrollView(size_hint_y=0.75)
+        # Use a consistent height for row to make it look like a proper table
+        report_layout = GridLayout(cols=4, spacing=5, size_hint_y=None, row_default_height=40, row_force_default=True)
+        report_layout.bind(minimum_height=report_layout.setter('height'))
+
+        # Header
+        headers = ['Time', 'Item', 'Quantity', 'Price']
+        for header in headers:
+            lbl = Label(text=header, bold=True, font_size='14sp', color=get_color_from_hex('#29B6F6'), font_name=DEFAULT_FONT)
+            report_layout.add_widget(lbl)
+
+        # Data rows
+        for sale in sales:
+            time = sale[1].split(' ')[1][:5]  # HH:MM format
+            report_layout.add_widget(Label(text=time, font_size='12sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+            report_layout.add_widget(Label(text=sale[2], font_size='12sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+            report_layout.add_widget(Label(text=str(sale[3]), font_size='12sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+            report_layout.add_widget(Label(text=f"₹{sale[4]:.2f}", font_size='12sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+
+        scroll.add_widget(report_layout)
+        content.add_widget(scroll)
+
+        # Export Button
+        csv_btn = Button(text="Export as CSV", size_hint_y=0.07, background_color=get_color_from_hex('#2196F3'))
+        csv_btn.bind(on_release=lambda x: self.export_report_as_csv(date_str, sales))
+        content.add_widget(csv_btn)
+
+        self.show_popup(f"Sales Report - {date_str}", content, size_hint=(0.95, 0.95))
+
+    def export_report_as_csv(self, date_str, sales):
+        """Export report as CSV for opening in spreadsheet editor"""
+        try:
+            reports_path = get_reports_path()
+            filename = os.path.join(reports_path, f"sales_report_{date_str}.csv")
+
+            with open(filename, 'w', encoding='utf-8', newline='') as csvfile:
+                fieldnames = ['ID', 'Date', 'Time', 'Item_Name', 'Quantity', 'Total_Price', 'Payment_Mode', 'Notes']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                writer.writeheader()
+                for sale in sales:
+                    sale_date_time = datetime.strptime(sale[1], "%Y-%m-%d %H:%M:%S")
+                    writer.writerow({
+                        'ID': sale[0],
+                        'Date': sale_date_time.strftime("%Y-%m-%d"),
+                        'Time': sale_date_time.strftime("%H:%M:%S"),
+                        'Item_Name': sale[2],
+                        'Quantity': sale[3],
+                        'Total_Price': f"₹{sale[4]:.2f}",
+                        'Payment_Mode': sale[5],
+                        'Notes': sale[6]
+                    })
+
+            self.show_alert(f"Report exported successfully!\n\nFile: {os.path.basename(filename)}\nPath: {reports_path}\n\nPlease use a file manager app to open the CSV.")
+
+        except Exception as e:
+            self.show_alert(f"Error exporting report: {str(e)}")
+
+    def show_popup(self, title, content, size_hint=(0.8, 0.8)):
+        if self.popup:
+            self.popup.dismiss()
+
+        self.popup = Popup(
+            title=title,
+            content=content,
+            size_hint=size_hint,
+            auto_dismiss=False,
+            background_color=get_color_from_hex('#000000'),
+            separator_color=get_color_from_hex('#333333'),
+            title_color=get_color_from_hex('#FFFFFF'),
+            title_font=DEFAULT_FONT
+        )
+        self.popup.open()
+
+    def show_alert(self, message):
+        content = BoxLayout(orientation='vertical', spacing=10, padding=20)
+        content.add_widget(Label(text=message, font_size='16sp', color=(1,1,1,1), font_name=DEFAULT_FONT))
+
+        ok_btn = Button(text='OK', size_hint_y=0.3, background_color=get_color_from_hex('#4CAF50'))
+        content.add_widget(ok_btn)
+
+        popup = Popup(
+            title='Info',
+            content=content,
+            size_hint=(0.7, 0.4),
+            background_color=get_color_from_hex('#000000'),
+            title_font=DEFAULT_FONT
+        )
+        ok_btn.bind(on_release=popup.dismiss)
+        popup.open()
+
+
+if __name__ == '__main__':
+    KioskApp().run()
